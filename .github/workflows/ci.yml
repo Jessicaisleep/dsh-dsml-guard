@@ -1,0 +1,37 @@
+name: ci
+
+# 每次推送与 PR 都跑，不发版。发版只由 publish.yml 在打 tag 时做。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax check
+        run: node --check lib/index.js
+
+      - name: Unit tests
+        run: node test/run.mjs
+
+      # 包必须能装：bundle manifest 存在、cordis.patch.yml 存在、
+      # 且 --dry-run 打出来的内容里没有测试/探针目录
+      - name: Pack dry run
+        run: npm pack --dry-run

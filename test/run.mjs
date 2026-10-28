@@ -197,4 +197,19 @@ test('连续失败上限可配且被夹在 1..100', () => {
 
 console.log(lines.join('\n'))
 console.log(`\n${passed} passed, ${failed} failed`)
+
+// 端到端历史一致性：单独一个文件，跑成子进程，任一失败整体非 0
+const { spawnSync } = await import('node:child_process')
+const { fileURLToPath } = await import('node:url')
+const historyPath = fileURLToPath(new URL('./history.mjs', import.meta.url))
+const history = spawnSync(process.execPath, [historyPath], { encoding: 'utf8' })
+if (history.status !== 0) {
+  console.log('\n--- test/history.mjs (block-end 历史一致性) ---')
+  console.log(history.stdout ?? '')
+  console.log(history.stderr ?? '')
+  console.log('history 用例失败')
+  process.exit(1)
+}
+console.log('  ok   block-end 历史一致性（test/history.mjs）')
+
 process.exit(failed === 0 ? 0 : 1)

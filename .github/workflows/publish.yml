@@ -1,0 +1,64 @@
+name: publish
+
+# 用 npm Trusted Publishing (OIDC) 发布：不再需要本地 token、不再受 2FA 拦截，
+# 也不会在机器上留任何凭据。触发方式只有「打 tag」——推送普通提交不会发版。
+#
+#   git tag v0.1.1 && git push origin v0.1.1
+#
+# 前置条件（在 npmjs.com 上一次性配置，见 README「发版」一节）：
+#   package 设置 → Trusted Publisher → GitHub Actions
+#     organization/user : Jessicaisleep
+#     repository        : dsh-dsml-guard
+#     workflow filename : publish.yml
+#   （不要填 Environment，除非这里也写了 environment。）
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # Trusted Publishing 用 OIDC 换短期 token，必须有这一项
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # npm >= 11.5.1 才支持 Trusted Publishing；Node 24 自带的 npm 已满足，这里再钉一次
+      - name: Ensure npm supports trusted publishing
+        run: |
+          npm install -g npm@^11.5.1
+          npm --version
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Syntax check
+        run: node --check lib/index.js
+
+      - name: Unit tests
+        run: node test/run.mjs
+
+      # tag 必须是 v<package.json version>，防止 tag 与包内版本对不上
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          VER="$(node -p "require('./package.json').version")"
+          echo "tag=$TAG version=$VER"
+          if [ "$TAG" != "$VER" ]; then
+            echo "::error::tag v$TAG does not match package.json version $VER"
+            exit 1
+          fi
+
+      - name: Publish to npm
+        run: npm publish --access public
