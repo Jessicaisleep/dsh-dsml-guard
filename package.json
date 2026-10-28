@@ -1,0 +1,51 @@
+{
+  "name": "dsh-dsml-guard",
+  "version": "0.1.0",
+  "description": "Strips DSML markers leaked into assistant prose and resumes a turn only when it truly produced nothing; quota, rate-limit and context errors are never retried. / 抹掉漏进正文的 DSML 标记，并只对「真的什么都没产出」的轮次补发一条继续。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.1-rc.2 <0.3.0"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsml",
+    "auto-continue",
+    "cordis"
+  ],
+  "license": "MIT",
+  "author": "Jessicaisleep",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jessicaisleep/dsh-dsml-guard.git"
+  },
+  "homepage": "https://github.com/Jessicaisleep/dsh-dsml-guard#readme",
+  "bugs": {
+    "url": "https://github.com/Jessicaisleep/dsh-dsml-guard/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "check": "node --check lib/index.js",
+    "test": "node test/run.mjs"
+  }
+}

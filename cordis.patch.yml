@@ -1,0 +1,4 @@
+# dsh-dsml-guard bundle patch: adds the guard row to the profile roster.
+- insert:
+    - id: dsml-guard
+      name: dsh-dsml-guard

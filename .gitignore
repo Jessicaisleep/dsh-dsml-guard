@@ -1,0 +1,7 @@
+# 本地探针与手工取证的临时产物，不进库、不进包
+_probe/
+node_modules/
+*.tgz
+*.log
+.DS_Store
+Thumbs.db
