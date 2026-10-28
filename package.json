@@ -1,6 +1,6 @@
 {
   "name": "dsh-dsml-guard",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Strips DSML markers leaked into assistant prose and resumes a turn only when it truly produced nothing; quota, rate-limit and context errors are never retried. / 抹掉漏进正文的 DSML 标记，并只对「真的什么都没产出」的轮次补发一条继续。",
   "type": "module",
   "main": "lib/index.js",
