@@ -4,6 +4,9 @@
 > 只在**发「继续」能真正解决**时续跑（本机/上游网络波动、单次回复 token 到顶、空响应/流中断/5xx/超时）；
 > 余额、额度、鉴权、上下文总体超限这类发继续只会再报错的，一律不动。默认连续 3 次失败后停发。
 
+**当前版本：0.1.3**（2026-11-12）。已发布到 npm（`dsh-dsml-guard@0.1.3`）与 GitHub（`v0.1.3` tag）。
+插件市场（awesome-dsh-plugin / dshmarket）收录的是仓库 URL、版本从 npm 自动刷新，无需在条目里写版本号。
+
 ## 为什么需要它
 
 本机实测（2026-10-28，扫 245 个 v4 会话 / 1.5 GB 文本）：
@@ -72,7 +75,7 @@
 
 1. **最省事**：在旧会话里跑一次 `/compact`，压缩会把脏段落折叠成摘要（摘要由模型写，不带标记）；
 2. **手动**：新建会话接着干活，旧会话只作查阅；
-3. **批量清洗存档**：`_probe/` 下有解码脚本，可写一个就地重写工具 —— 但那是改历史，
+3. **批量清洗存档**：写个脚本解码 v4 存档、就地重写那几条脏消息 —— 但那是改历史，
    需要单独确认后再做（本插件当前**不**提供这个动作）。
 
 
@@ -124,6 +127,8 @@
 dsh plugin --profile <你的 profile> add dsh-dsml-guard
 ```
 
+当前 npm 最新版是 **0.1.3**。想锁死版本、避免以后自动漂移，写成 `dsh-dsml-guard@0.1.3`。
+
 `--profile` 填对方实际在用的那个：
 **桌面应用用 `desktop`**，自启的 `dsh web` 服务用 `web`。填错 profile 等于没装 —— 重启多少次都不会加载。
 
@@ -132,7 +137,7 @@ dsh plugin --profile <你的 profile> add dsh-dsml-guard
 不用 npm 也可以直接从 GitHub 装（锁 tag，内容不会漂移）：
 
 ```sh
-dsh plugin --profile <profile> add https://github.com/Jessicaisleep/dsh-dsml-guard/archive/refs/tags/v0.1.0.tar.gz
+dsh plugin --profile <profile> add https://github.com/Jessicaisleep/dsh-dsml-guard/archive/refs/tags/v0.1.3.tar.gz
 ```
 
 > 用 GitHub 源装会在对方机器上跑构建脚本（本包没有构建步骤，只是 pnpm 的常规授权流程），
@@ -162,16 +167,29 @@ dsh --profile web --dump-config | Select-String "dsml-guard"
 ## 发版（Git 工作流，不走本地 npm token）
 
 发布由 GitHub Actions 用 **npm Trusted Publishing（OIDC）** 完成，本地不需要任何 npm token，也就不会再被 2FA 挡住。
-
-**发一版只需两条命令：**
-
-```sh
-npm version patch        # 或 minor / major，会自动改 package.json 并打 tag
-git push --follow-tags   # 推提交 + 推 tag
-```
+推一个 `v*` tag 就发一版；普通提交只触发 `ci.yml`（Node 20/22/24 三档跑测试 + `npm pack --dry-run`），**不会发版**。
 
 `publish.yml` 在 tag 推送后自动执行：语法检查 → 35 条单元测试 → 校验 tag 与 `package.json` 版本一致 → `npm publish`。
-普通提交只触发 `ci.yml`（Node 20/22/24 三档跑测试 + `npm pack --dry-run`），**不会发版**。
+
+**常规流程**（版本号交给 npm 改 + 打 tag，一次到位）：
+
+```sh
+npm version patch        # 或 minor / major：改 package.json 并打一个 vX.Y.Z tag
+git push --follow-tags   # 推提交 + 推 tag，触发 publish.yml
+```
+
+三个踩过的坑，照着避：
+
+1. **tag 必须和 `package.json` 的 `version` 逐字一致**。`publish.yml` 里有一步
+   `Verify tag matches package version`，不一致直接 `::error::tag v$TAG does not match package.json version $VER` 退出。
+2. **如果已经手工把 `package.json` 改成了目标版本号，就不要再跑 `npm version patch`** —— 它会再 +1（0.1.3 → 0.1.4），
+   和 tag 对不上。这种情况直接 `git tag -a v0.1.3 -m "release 0.1.3"` 然后推 tag 即可。
+3. **本机 `github.com:443` 时段性连不上**（SSH 又没配密钥）。推不上去时不用硬扛：
+   `api.github.com` 一直通，可以用它的 **Git Data API**（造 blob/tree/commit/tag 对象，再 `PATCH /git/refs/heads/main`、
+   `POST /git/refs` 建 tag ref）把提交和 tag 直接推上去，完全绕开 `github.com:443`。
+   注意造对象时内容要取自 `git cat-file blob <sha>`（保证 CRLF/BOM 与本地对象库一致），
+   commit/tag 的 message 要带尾随换行，否则远端 sha 和本地对不上。
+   工作区里的 `D:\DSH工作区\github-helper\README.md` 有这套通道的说明与脚本。
 
 ### 一次性配置（已经做过，换电脑或换仓库才需要重来）
 
@@ -185,6 +203,17 @@ git push --follow-tags   # 推提交 + 推 tag
 | Environment | 留空 |
 
 > 配好之后，本地 `pnpm publish` 就不再需要了；也建议到 npm 上**吊销**之前那个 `npm_` token（它现在没用了，留着只是多一个可被滥用的凭据）。
+
+## 更新日志
+
+| 版本 | 日期 | 内容 |
+| --- | --- | --- |
+| 0.1.0 | 2026-10-28 | 初版：DSML 标记清洗（`text-delta`）+ 证据门控的自动续跑 |
+| 0.1.1 | 2026-10-29 | 补上 `block-end` 清洗，让「历史 = 屏幕」；加 `ci.yml` / `publish.yml`（OIDC 发版）与 `test/history.mjs` |
+| 0.1.2 | 2026-10-29 | 纯发版（package.json 版本号推进），代码与 0.1.1 相同 |
+| **0.1.3** | **2026-11-12** | 连续续跑上限 5→**3**、正常回复/`reason` 为空的正常完成轮清零；新增 `max-tokens` 续跑；可重试集补 `EMPTY_RESPONSE/STREAM_CLOSED/NETWORK_ERROR`；对 `INVALID_REQUEST/CLIENT_ERROR/PI_AI_ERROR/UNKNOWN` 做报文级细分（本机/上游网络波动续、永久配置错误否）；`decideSend` 纯函数化并加端到端用例（单测总数扩到 35 条） |
+
+> `0.1.3` 的完整判定依据见下方「与同类插件的覆盖对比」。
 
 ## 配置（可选）
 
@@ -237,7 +266,7 @@ node test/replay-real.mjs  # 端到端：动态扫描会话存档，把捕获到
 | `@aiwayds/dsh-llm-net-retry`（[README](https://github.com/fan56/dsh-llm-net-retry/blob/main/README.md)） | **step 级**有界重试（挂在 `agent/request-error`），非 turn 级继续；官方默认可重试集 `EMPTY_RESPONSE/RATE_LIMIT/SERVER/TIMEOUT/TRANSPORT`；分类盲区 `MALFORMED_RESPONSE`、`STREAM_CLOSED`、`PI_AI_ERROR` 兜底（network_error / unexpected EOF / tls bad record MAC 等） | 层次不同、互补不冲突。采纳其可重试集与「分类盲区」清单，补进 `EMPTY_RESPONSE/STREAM_CLOSED/NETWORK_ERROR`；`SERVER/TIMEOUT/TRANSPORT` 本插件已有 |
 | `dsh-client-auto-continue`、`@windypro-rourou/dsh-auto-continue` | 浏览器/宿主引擎侧；有暂停、循环打断、按次数换续跑文案、模型回退等 | 与 turn 级 `agent.followup` 不同层，本插件不引入界面/模型回退，保持单一职责 |
 
-本机证据（`_probe/error-messages.mjs`，扫全部 v4 会话 317 个 error 轮）：
+本机证据（调研时的临时探针扫全部 v4 会话 317 个 error 轮；探针已清理，数据保留在此）：
 
 - `max-tokens` 有 7 次（`{"kind":"max-tokens"}`，无 error 对象）——改前完全没处理；
 - `INVALID_REQUEST` 88 次里大量其实是 `read tcp 127.0.0.1:7863->…: i/o timeout`（本机网络波动被顶层码误分类），
