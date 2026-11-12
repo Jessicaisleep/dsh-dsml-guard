@@ -1,7 +1,8 @@
 # dsh-dsml-guard
 
-> 专治 DSML 泄漏：把模型漏进正文的标记抹掉，并在「这一轮其实什么都没产出」时自动补一条 **继续**。
-> 只对超时 / 断联 / 空响应这类**重试有意义**的失败续跑；余额、额度、上下文超限一律不动。
+> 专治 DSML 泄漏：把模型漏进正文的标记抹掉，并在「这一轮其实什么都没产出」或「上游临时失败」时自动补一条 **继续**。
+> 只在**发「继续」能真正解决**时续跑（本机/上游网络波动、单次回复 token 到顶、空响应/流中断/5xx/超时）；
+> 余额、额度、鉴权、上下文总体超限这类发继续只会再报错的，一律不动。默认连续 3 次失败后停发。
 
 ## 为什么需要它
 
@@ -81,17 +82,26 @@
 
 - `invoke-block` 泄漏 **且** 这一轮没有发出过任何 `tool-call-delta` → 调用确实丢了，一轮没产出；
 - `tail-close` 泄漏 **且** 正文短于 `tailCloseMinChars`（默认 80 字符）→ 视为没产出；
-- `turn/end` 是 `TIMEOUT` / `TRANSPORT` / `SERVER` / `MALFORMED_RESPONSE` / `PI_AI_ERROR` / `UNKNOWN`。
+- `turn/end.reason.kind === 'max-tokens'`：**单次回复输出 token 到顶**（不是上下文超限），继续能接着写；
+- `turn/end` 错误码属于可重试集：`TIMEOUT` / `TRANSPORT` / `SERVER` / `MALFORMED_RESPONSE` /
+  `PI_AI_ERROR` / `UNKNOWN` / `EMPTY_RESPONSE` / `STREAM_CLOSED` / `NETWORK_ERROR`；
+- 兜底码（`INVALID_REQUEST` / `CLIENT_ERROR` / `PI_AI_ERROR` / `UNKNOWN` 等）**报文**里是
+  `i/o timeout` / `read tcp` / `stream interrupted` 这类本机/上游网络波动时，按报文推翻顶层分类续跑
+  （本机实测大量 `INVALID_REQUEST` 其实是 `read tcp … i/o timeout`）。
 
 **不续跑**（发继续也会照样报错，浪费一次往返）：
 
 `QUOTA`、`QUOTA_EXCEEDED`、`ACCOUNT_QUOTA`、`RATE_LIMIT`、`AUTH`、`MISSING_CREDENTIAL`、
-`CONTEXT_WINDOW_EXCEEDED`、`UNKNOWN_MODEL`、`HTTP_413`、`INVALID_REQUEST`；
+`CONTEXT_WINDOW_EXCEEDED`、`UNKNOWN_MODEL`、`HTTP_413`、`CLIENT_ERROR`、`INVALID_REQUEST`；
 以及 `aborted` / `interrupted`（用户自己按了停，不该替他续）。
+兜底码报文里是「未配置凭据 / 请先登录 / 无此模型 / 余额不足」时按报文否决。
+明确永久码（额度/鉴权/上下文/体积）按码否决、信任码本身，不被报文里的网络措辞带偏。
 
 还有两道闸：
 
-- **同一会话连续续跑上限** `maxConsecutive`（默认 5，夹在 1–100）；
+- **同一会话连续续跑上限** `maxConsecutive`（默认 **3**，夹在 1–100）：连续 3 次「失败 → 继续」后不再发；
+  **中间只要有一次正常回复就清零重算**（`失败-继续-正常回复-失败-继续-失败-继续-失败` 到这里只算 2 次，仍会继续发）。
+  不续跑的永久错误不算正常回复、不打断连续链，计数保持不变；
 - **用户一说话就清空**：你手动发消息会取消待发的续跑并把计数归零（插件自己补的那条不算干预）。
 
 ## 适用版本
@@ -160,7 +170,7 @@ npm version patch        # 或 minor / major，会自动改 package.json 并打 
 git push --follow-tags   # 推提交 + 推 tag
 ```
 
-`publish.yml` 在 tag 推送后自动执行：语法检查 → 20 条单元测试 → 校验 tag 与 `package.json` 版本一致 → `npm publish`。
+`publish.yml` 在 tag 推送后自动执行：语法检查 → 35 条单元测试 → 校验 tag 与 `package.json` 版本一致 → `npm publish`。
 普通提交只触发 `ci.yml`（Node 20/22/24 三档跑测试 + `npm pack --dry-run`），**不会发版**。
 
 ### 一次性配置（已经做过，换电脑或换仓库才需要重来）
@@ -186,23 +196,25 @@ git push --follow-tags   # 推提交 + 推 tag
     sanitize: true           # 抹标记
     autoContinue: true       # 自动补「继续」
     continueText: "继续"
-    maxConsecutive: 5        # 连续续跑上限
+    maxConsecutive: 3        # 连续续跑上限（默认 3，正常回复清零）
     tailCloseMinChars: 80    # tail-close 形态下，正文短于这个才续跑
-    retryCodes: [TIMEOUT, TRANSPORT, SERVER, MALFORMED_RESPONSE, PI_AI_ERROR, UNKNOWN]
+    retryCodes: [TIMEOUT, TRANSPORT, SERVER, MALFORMED_RESPONSE, PI_AI_ERROR, UNKNOWN,
+                 EMPTY_RESPONSE, STREAM_CLOSED, NETWORK_ERROR]
     neverCodes: [QUOTA, QUOTA_EXCEEDED, ACCOUNT_QUOTA, RATE_LIMIT, AUTH,
                  MISSING_CREDENTIAL, CONTEXT_WINDOW_EXCEEDED, UNKNOWN_MODEL,
-                 HTTP_413, INVALID_REQUEST]
+                 HTTP_413, CLIENT_ERROR, INVALID_REQUEST]
 ```
 
 ## 测试
 
 ```powershell
-node test/run.mjs          # 20 条单元用例，不含真实会话
-node test/replay-real.mjs  # 端到端：把真实会话里捕获的 29 条泄漏正文原样喂进来
+node test/run.mjs          # 35 条单元用例，不含真实会话
+node test/replay-real.mjs  # 端到端：动态扫描会话存档，把捕获到的泄漏正文原样喂进来
 ```
 
 `replay-real.mjs` 是验收关键：它要求**围栏外的正文一条标记都不许剩**。
-当前结果：样本 29 条，清洗后 0 条残留，判定续跑 19 条（13 invoke-block + 6 tail-close）。
+它每次动态扫描 `D:\Program Files (x86)\DSH_Data\sessions`，样本数随存档快照变化、会漂移。
+本次实测（2026-11-12）：样本 28 条，清洗后 0 条残留，判定续跑 18 条（12 invoke-block + 6 tail-close）。
 
 `test/history.mjs` 覆盖另一条链路，已并入 `node test/run.mjs` 一起跑：宿主是用 **`block-end` 携带的
 完整 block 全文**组装 `AssistantMessage` 落进会话历史的。只清洗 `text-delta` 的话，**屏幕干净、历史仍是脏的**，
@@ -210,6 +222,32 @@ node test/replay-real.mjs  # 端到端：把真实会话里捕获的 29 条泄�
 断言「显示 == 历史」两边都不含标记。
 
 > **0.1.1 起的修正**：`0.1.0` 只处理 `text-delta`，没有覆盖 `block-end`，所以历史里仍会留下标记。
+
+## 与同类插件的覆盖对比（0.1.3 的判定依据）
+
+用户要求「和市场的同类插件涵盖范围比，看是否需要增加一些」。判定口径不是照抄码表，而是
+**「发『继续』能不能真正解决」**：本机/上游网络临时波动、单次回复 token 到顶、空响应这类能；
+余额/额度/鉴权、上下文总体超限（`CONTEXT_WINDOW_EXCEEDED` / `HTTP_413`，只能新开对话/压缩）这类不能。
+
+调研对象与结论（2026-11-12）：
+
+| 插件 | 层次 / 触发条件 | 对本插件的取舍 |
+| --- | --- | --- |
+| `dsh-auto-continue` v0.4.7（spix18，[GitHub](https://github.com/spix18/dsh-auto-continue)） | turn 级；`max-tokens` 续；可重试集 `RATE_LIMIT/QUOTA/ACCOUNT_QUOTA/EMPTY_RESPONSE`；`invalid_request_error` 靠报文匹配；默认 20 次、1–2 秒随机退避、用户发消息清零 | 采纳 `max-tokens` 续跑、`EMPTY_RESPONSE`、报文级分类、连续计数+正常回复清零。**不采纳**它的 `QUOTA/RATE_LIMIT` 续跑：本机报文是账号受限/余额不足/定时解禁，1–2 秒后立即发继续无益，且 dsh-llm 已在 step 内带退避重试过 RATE_LIMIT；保留本插件原有「额度类一律不续」的已验收行为 |
+| `@aiwayds/dsh-llm-net-retry`（[README](https://github.com/fan56/dsh-llm-net-retry/blob/main/README.md)） | **step 级**有界重试（挂在 `agent/request-error`），非 turn 级继续；官方默认可重试集 `EMPTY_RESPONSE/RATE_LIMIT/SERVER/TIMEOUT/TRANSPORT`；分类盲区 `MALFORMED_RESPONSE`、`STREAM_CLOSED`、`PI_AI_ERROR` 兜底（network_error / unexpected EOF / tls bad record MAC 等） | 层次不同、互补不冲突。采纳其可重试集与「分类盲区」清单，补进 `EMPTY_RESPONSE/STREAM_CLOSED/NETWORK_ERROR`；`SERVER/TIMEOUT/TRANSPORT` 本插件已有 |
+| `dsh-client-auto-continue`、`@windypro-rourou/dsh-auto-continue` | 浏览器/宿主引擎侧；有暂停、循环打断、按次数换续跑文案、模型回退等 | 与 turn 级 `agent.followup` 不同层，本插件不引入界面/模型回退，保持单一职责 |
+
+本机证据（`_probe/error-messages.mjs`，扫全部 v4 会话 317 个 error 轮）：
+
+- `max-tokens` 有 7 次（`{"kind":"max-tokens"}`，无 error 对象）——改前完全没处理；
+- `INVALID_REQUEST` 88 次里大量其实是 `read tcp 127.0.0.1:7863->…: i/o timeout`（本机网络波动被顶层码误分类），
+  所以顶层码不足以判定，需**报文级细分**：兜底码（INVALID_REQUEST/CLIENT_ERROR/PI_AI_ERROR/UNKNOWN…）
+  报文是传输层信号就续、是「未配置凭据/无此模型/余额不足」就否；
+- `UNKNOWN` 里出现过 `未配置凭据，请先登录`（永久错误），按报文否决；
+- PI_AI_ERROR 的 `in_flight_budget_exhausted … Retry after in-flight requests settle` 是可重试的，
+  正则刻意避开 `credits/add credits` 这类含糊措辞，不误杀。
+
+> 明确永久码（额度/鉴权/上下文/体积）按码否决、信任码本身，不被报文里的网络措辞带偏 —— 这是刻意保留的已验收行为。
 
 ## 已知限制
 

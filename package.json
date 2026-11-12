@@ -1,7 +1,7 @@
 {
   "name": "dsh-dsml-guard",
-  "version": "0.1.2",
-  "description": "Strips DSML markers leaked into assistant prose and resumes a turn only when it truly produced nothing; quota, rate-limit and context errors are never retried. / 抹掉漏进正文的 DSML 标记，并只对「真的什么都没产出」的轮次补发一条继续。",
+  "version": "0.1.3",
+  "description": "Strips DSML markers leaked into assistant prose and resumes a turn when a 继续 genuinely helps (network blips, max-tokens, empty/stream errors), with a default cap of 3 consecutive failures reset by any normal reply; quota, auth and context-window errors are never retried. / 抹掉漏进正文的 DSML 标记，并只在「发继续能真正解决」时补发；默认连续 3 次失败后停发、正常回复清零；额度/鉴权/上下文超限一律不续。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

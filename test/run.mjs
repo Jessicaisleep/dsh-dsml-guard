@@ -15,7 +15,11 @@ import {
   detectLeak,
   decideContinue,
   resolveConfig,
+  apply,
 } from '../lib/index.js'
+// 命名空间引用：新增的 decideSend 在 RED 阶段还不存在，用 guard.decideSend 访问
+// 不会让整个 ESM 模块加载失败，能正常看到用例 FAIL。
+import * as guard from '../lib/index.js'
 
 let passed = 0
 let failed = 0
@@ -190,9 +194,205 @@ test('完全正常的一轮不续', () => {
 })
 
 test('连续失败上限可配且被夹在 1..100', () => {
-  assert.equal(resolveConfig({ maxConsecutive: 0 }).maxConsecutive, 5)
+  assert.equal(resolveConfig({ maxConsecutive: 0 }).maxConsecutive, 3)
   assert.equal(resolveConfig({ maxConsecutive: 999 }).maxConsecutive, 100)
   assert.equal(resolveConfig({ maxConsecutive: 3 }).maxConsecutive, 3)
+})
+
+// ── ③ 连续次数上限 + 触发场景（对比市场同类插件后补充）────────────────
+// 依据（本机 317 个 error 轮 + asar 类型定义 + 市场插件对比）：
+//   · max-tokens(kind) = 单次回复输出 token 到顶，继续能接着写  → 该续
+//   · CONTEXT_WINDOW_EXCEEDED / HTTP_413 = 上下文/体积总体超限，发继续也是报错 → 不续
+//   · INVALID_REQUEST 里大量是 `read tcp ... i/o timeout`（本机网络波动误分类）→ 该续
+test('默认连续续跑上限为 3', () => {
+  assert.equal(resolveConfig({}).maxConsecutive, 3)
+})
+
+test('单次回复 token 到顶（max-tokens）→ 续跑', () => {
+  const verdict = decideContinue({ kind: 'max-tokens' }, {}, CFG)
+  assert.equal(verdict.retry, true)
+})
+
+test('上游空响应 / 流中断 / 网络错误 → 续跑（可重试集）', () => {
+  for (const code of ['EMPTY_RESPONSE', 'STREAM_CLOSED', 'NETWORK_ERROR']) {
+    const verdict = decideContinue({ kind: 'error', error: { code, message: code } }, {}, CFG)
+    assert.equal(verdict.retry, true, `${code} 应当续跑`)
+  }
+})
+
+test('上下文总体超限 / 体积过大 → 不续（发继续也是再报错）', () => {
+  const msg = '400: {"message":"prompt is too long: 1955535 tokens > 1048576 maximum"}'
+  for (const code of ['CONTEXT_WINDOW_EXCEEDED', 'HTTP_413', 'CLIENT_ERROR']) {
+    const verdict = decideContinue({ kind: 'error', error: { code, message: msg } }, {}, CFG)
+    assert.equal(verdict.retry, false, `${code} 不该续跑`)
+  }
+})
+
+test('INVALID_REQUEST 报文是本机网络 i/o timeout → 续跑（顶层码误分类）', () => {
+  const verdict = decideContinue(
+    {
+      kind: 'error',
+      error: {
+        code: 'INVALID_REQUEST',
+        message: '400: read body: read tcp 127.0.0.1:7863->127.0.0.1:39828: i/o timeout',
+      },
+    },
+    {},
+    CFG,
+  )
+  assert.equal(verdict.retry, true)
+})
+
+test('INVALID_REQUEST 是真正的坏请求 → 不续', () => {
+  const verdict = decideContinue(
+    {
+      kind: 'error',
+      error: { code: 'INVALID_REQUEST', message: '400: {"message":"openai_error","type":"invalid_request_error"}' },
+    },
+    {},
+    CFG,
+  )
+  assert.equal(verdict.retry, false)
+})
+
+// ── ④ decideSend：把「连续」语义抽成可单测的纯函数 ────────────────────
+test('需要导出 decideSend 纯函数', () => {
+  assert.equal(typeof guard.decideSend, 'function', 'decideSend 必须导出')
+})
+
+test('decideSend：连续 3 次失败后第 4 次不再发送', () => {
+  const v = { retry: true, why: 'TIMEOUT' }
+  const err = { kind: 'error', error: { code: 'TIMEOUT' } }
+  let n = 0
+  const sends = []
+  for (let i = 0; i < 4; i++) {
+    const d = guard.decideSend(v, err, n, CFG)
+    sends.push(d.send)
+    n = d.consecutive
+  }
+  assert.deepEqual(sends, [true, true, true, false])
+})
+
+test('decideSend：正常回复（completed）清零后重算', () => {
+  const retry = { retry: true, why: 'SERVER' }
+  const err = { kind: 'error', error: { code: 'SERVER' } }
+  let n = 0
+  n = guard.decideSend(retry, err, n, CFG).consecutive
+  n = guard.decideSend(retry, err, n, CFG).consecutive
+  n = guard.decideSend({ retry: false, why: '正常结束' }, { kind: 'completed' }, n, CFG).consecutive
+  const d = guard.decideSend(retry, err, n, CFG)
+  assert.equal(d.consecutive, 1)
+  assert.equal(d.send, true)
+})
+
+test('decideSend：reason 为空的正常完成轮也清零（修复漏清零）', () => {
+  const d = guard.decideSend({ retry: false, why: '正常结束' }, undefined, 2, CFG)
+  assert.equal(d.consecutive, 0)
+  assert.equal(d.reset, true)
+})
+
+test('decideSend：不续跑的永久性错误不清零（仍算连续失败）', () => {
+  const d = guard.decideSend(
+    { retry: false, why: '发继续也会报错' },
+    { kind: 'error', error: { code: 'CONTEXT_WINDOW_EXCEEDED' } },
+    2,
+    CFG,
+  )
+  assert.equal(d.consecutive, 2)
+  assert.equal(d.reset, false)
+})
+
+test('decideSend：max-tokens 被配成不续时也不清零（不是正常回复）', () => {
+  const d = guard.decideSend(
+    { retry: false, why: 'MAX_TOKENS 被配置成不续' },
+    { kind: 'max-tokens' },
+    2,
+    CFG,
+  )
+  assert.equal(d.consecutive, 2)
+  assert.equal(d.reset, false)
+  assert.equal(d.send, false)
+})
+
+// ── ⑤ apply 端到端：真正数 agent.followup 的调用次数 ──────────────────
+function makeHarness(cfg = {}) {
+  const handlers = new Map()
+  const followups = []
+  const agent = { followup: (msg) => followups.push(msg) }
+  const ctx = {
+    effect(fn) {
+      fn()
+      return () => {}
+    },
+    on(event, handler) {
+      if (!handlers.has(event)) handlers.set(event, [])
+      handlers.get(event).push(handler)
+      return () => {}
+    },
+    logger: { info() {}, warn() {}, error() {} },
+    agents: { get: () => agent },
+  }
+  apply(ctx, cfg)
+  return {
+    emit: (session, event) => {
+      for (const h of handlers.get('session/event') ?? []) h(session, event)
+    },
+    followups,
+  }
+}
+
+function withImmediateTimers(fn) {
+  const realSetTimeout = globalThis.setTimeout
+  const realClearTimeout = globalThis.clearTimeout
+  globalThis.setTimeout = (cb) => {
+    cb()
+    return 0
+  }
+  globalThis.clearTimeout = () => {}
+  try {
+    return fn()
+  } finally {
+    globalThis.setTimeout = realSetTimeout
+    globalThis.clearTimeout = realClearTimeout
+  }
+}
+
+const FAIL_EVENT = {
+  type: 'turn/end',
+  data: { reason: { kind: 'error', error: { code: 'TIMEOUT' } } },
+}
+
+test('apply：默认配置下 失败-继续×4，第 4 次失败不再补发（共 3 次）', () => {
+  const h = makeHarness()
+  withImmediateTimers(() => {
+    for (let i = 0; i < 4; i++) h.emit({ id: 's1' }, FAIL_EVENT)
+  })
+  assert.equal(h.followups.length, 3)
+})
+
+test('apply：中间有正常回复（reason 为空）则清零，后续仍可再发', () => {
+  const h = makeHarness({ maxConsecutive: 3 })
+  const normal = { type: 'turn/end', data: { reason: undefined } }
+  withImmediateTimers(() => {
+    h.emit({ id: 's1' }, FAIL_EVENT) // 1
+    h.emit({ id: 's1' }, normal) // 清零
+    h.emit({ id: 's1' }, FAIL_EVENT) // 1
+    h.emit({ id: 's1' }, FAIL_EVENT) // 2
+    h.emit({ id: 's1' }, FAIL_EVENT) // 3（"到这里是两次，所以继续发送"）
+  })
+  assert.equal(h.followups.length, 4)
+})
+
+test('apply：上下文总体超限不补发继续', () => {
+  const h = makeHarness()
+  const ctxErr = {
+    type: 'turn/end',
+    data: { reason: { kind: 'error', error: { code: 'CONTEXT_WINDOW_EXCEEDED', message: 'prompt is too long' } } },
+  }
+  withImmediateTimers(() => {
+    h.emit({ id: 's1' }, ctxErr)
+  })
+  assert.equal(h.followups.length, 0)
 })
 
 console.log(lines.join('\n'))
