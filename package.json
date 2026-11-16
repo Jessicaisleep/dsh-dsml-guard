@@ -1,7 +1,7 @@
 {
   "name": "dsh-dsml-guard",
-  "version": "0.1.3",
-  "description": "Strips DSML markers leaked into assistant prose and resumes a turn when a 继续 genuinely helps (network blips, max-tokens, empty/stream errors), with a default cap of 3 consecutive failures reset by any normal reply; quota, auth and context-window errors are never retried. / 抹掉漏进正文的 DSML 标记，并只在「发继续能真正解决」时补发；默认连续 3 次失败后停发、正常回复清零；额度/鉴权/上下文超限一律不续。",
+  "version": "0.1.4",
+  "description": "Strips DSML markers leaked into assistant prose and resumes a turn when a 继续 genuinely helps (max-tokens, empty/closed streams, misclassified network blips), with a default cap of 3 consecutive failures reset by any normal reply; quota, auth and context-window errors are never retried; overlap with DSH's own per-provider retry policy (EMPTY_RESPONSE/SERVER/TIMEOUT/TRANSPORT) is delegated to the host by default (skipHostRetriedCodes). / 抹掉漏进正文的 DSML 标记，并只在「发继续能真正解决」时补发；默认连续 3 次失败后停发、正常回复清零；额度/鉴权/上下文超限一律不续；与 DSH 自带「重试策略」重叠的四个错误码默认交给宿主，不重复续跑（skipHostRetriedCodes）。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

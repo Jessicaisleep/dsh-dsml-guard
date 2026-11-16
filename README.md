@@ -1,10 +1,11 @@
 # dsh-dsml-guard
 
 > 专治 DSML 泄漏：把模型漏进正文的标记抹掉，并在「这一轮其实什么都没产出」或「上游临时失败」时自动补一条 **继续**。
-> 只在**发「继续」能真正解决**时续跑（本机/上游网络波动、单次回复 token 到顶、空响应/流中断/5xx/超时）；
+> 只在**发「继续」能真正解决**时续跑（单次回复 token 到顶、空响应/流中断/5xx、被误分类成坏请求的网络抖动）；
 > 余额、额度、鉴权、上下文总体超限这类发继续只会再报错的，一律不动。默认连续 3 次失败后停发。
+> 与 DSH 自带「重试策略」重叠的四个码默认交给宿主重试，插件不重复打（见「与 DSH 自带重试策略的分工」）。
 
-**当前版本：0.1.3**（2026-11-12）。已发布到 npm（`dsh-dsml-guard@0.1.3`）与 GitHub（`v0.1.3` tag）。
+**当前版本：0.1.4**（2026-11-17）。已发布到 npm（`dsh-dsml-guard@0.1.4`）与 GitHub（`v0.1.4` tag）。
 插件市场（awesome-dsh-plugin / dshmarket）收录的是仓库 URL、版本从 npm 自动刷新，无需在条目里写版本号。
 
 ## 为什么需要它
@@ -146,7 +147,7 @@ dsh plugin --profile <profile> add https://github.com/Jessicaisleep/dsh-dsml-gua
 改源码时用本地路径装（每次改动后要重新 `add` 一次才生效）：
 
 ```powershell
-dsh plugin --profile desktop add "file:D:\DSH工作区\DSH插件\dsh-dsml-guard"
+dsh plugin --profile desktop add "file:E:\DSHWORK\DSH插件\dsh-dsml-guard"
 ```
 
 然后重启 DSH。配置文件 `profiles/desktop/cordis.patch.yml` 里出现下面这段即视为加载：
@@ -169,7 +170,7 @@ dsh --profile web --dump-config | Select-String "dsml-guard"
 发布由 GitHub Actions 用 **npm Trusted Publishing（OIDC）** 完成，本地不需要任何 npm token，也就不会再被 2FA 挡住。
 推一个 `v*` tag 就发一版；普通提交只触发 `ci.yml`（Node 20/22/24 三档跑测试 + `npm pack --dry-run`），**不会发版**。
 
-`publish.yml` 在 tag 推送后自动执行：语法检查 → 35 条单元测试 → 校验 tag 与 `package.json` 版本一致 → `npm publish`。
+`publish.yml` 在 tag 推送后自动执行：语法检查 → 42 条单元测试 → 校验 tag 与 `package.json` 版本一致 → `npm publish`。
 
 **常规流程**（版本号交给 npm 改 + 打 tag，一次到位）：
 
@@ -189,7 +190,7 @@ git push --follow-tags   # 推提交 + 推 tag，触发 publish.yml
    `POST /git/refs` 建 tag ref）把提交和 tag 直接推上去，完全绕开 `github.com:443`。
    注意造对象时内容要取自 `git cat-file blob <sha>`（保证 CRLF/BOM 与本地对象库一致），
    commit/tag 的 message 要带尾随换行，否则远端 sha 和本地对不上。
-   工作区里的 `D:\DSH工作区\github-helper\README.md` 有这套通道的说明与脚本。
+   工作区里的 `E:\DSHWORK\github-helper\README.md` 有这套通道的说明与脚本。
 
 ### 一次性配置（已经做过，换电脑或换仓库才需要重来）
 
@@ -213,7 +214,9 @@ git push --follow-tags   # 推提交 + 推 tag，触发 publish.yml
 | 0.1.2 | 2026-10-29 | 纯发版（package.json 版本号推进），代码与 0.1.1 相同 |
 | **0.1.3** | **2026-11-12** | 连续续跑上限 5→**3**、正常回复/`reason` 为空的正常完成轮清零；新增 `max-tokens` 续跑；可重试集补 `EMPTY_RESPONSE/STREAM_CLOSED/NETWORK_ERROR`；对 `INVALID_REQUEST/CLIENT_ERROR/PI_AI_ERROR/UNKNOWN` 做报文级细分（本机/上游网络波动续、永久配置错误否）；`decideSend` 纯函数化并加端到端用例（单测总数扩到 35 条） |
 
-> `0.1.3` 的完整判定依据见下方「与同类插件的覆盖对比」。
+| **0.1.4** | **2026-11-17** | 新增 `skipHostRetriedCodes`（默认 `true`）：与 DSH ≥0.2.2 模型设置页「重试策略」（`@deepseek-ai/dsh-llm-retry`，默认「仅临时错误」）重叠的 `EMPTY_RESPONSE/SERVER/TIMEOUT/TRANSPORT` 交给宿主在 step 内退避重试，插件不再叠加一条「继续」；置 `false` 恢复 0.1.3 的兜底。清洗与 `max-tokens`/泄漏续跑不受影响（真实会话回放 28 条、残留 0 条、判续 18 条，与 0.1.3 一致）。单测 35→42 |
+
+> `0.1.3` 的完整判定依据见下方「与同类插件的覆盖对比」；`0.1.4` 的分工见「与 DSH 自带重试策略的分工」。
 
 ## 配置（可选）
 
@@ -227,6 +230,7 @@ git push --follow-tags   # 推提交 + 推 tag，触发 publish.yml
     continueText: "继续"
     maxConsecutive: 3        # 连续续跑上限（默认 3，正常回复清零）
     tailCloseMinChars: 80    # tail-close 形态下，正文短于这个才续跑
+    skipHostRetriedCodes: true   # 与 DSH「重试策略」重叠的四个码交给宿主，不重复续跑（见下节）
     retryCodes: [TIMEOUT, TRANSPORT, SERVER, MALFORMED_RESPONSE, PI_AI_ERROR, UNKNOWN,
                  EMPTY_RESPONSE, STREAM_CLOSED, NETWORK_ERROR]
     neverCodes: [QUOTA, QUOTA_EXCEEDED, ACCOUNT_QUOTA, RATE_LIMIT, AUTH,
@@ -234,10 +238,45 @@ git push --follow-tags   # 推提交 + 推 tag，触发 publish.yml
                  HTTP_413, CLIENT_ERROR, INVALID_REQUEST]
 ```
 
+## 与 DSH 自带重试策略的分工（0.1.4）
+
+DSH 0.2.2 起，模型设置页每个 API 下多了**「重试策略」**（默认「仅临时错误」）。执行器是
+`@deepseek-ai/dsh-llm-retry`，挂在 `agent/request-error` 上，**在同一个 step 内**重跑失败的请求：
+默认 5 次、500ms→10s 指数退避、±10% 抖动，可重试集
+`EMPTY_RESPONSE / RATE_LIMIT / SERVER / TIMEOUT / TRANSPORT`。它不新开 turn、不追加 user 消息，
+失败的那段部分输出直接丢弃（不进历史、不进上下文）。
+
+两者层次不同（宿主在 step 内重发同一请求，本插件在 turn 结束后补一条「继续」），但错误码上有四个重叠。
+0.1.4 起**默认把重叠面交给宿主**，插件不再对同一份请求再打一轮：
+
+| 错误码 / 场景 | 谁处理（默认） |
+| --- | --- |
+| `EMPTY_RESPONSE` `SERVER` `TIMEOUT` `TRANSPORT` | 宿主 `llm-retry`（插件跳过） |
+| `MALFORMED_RESPONSE` `PI_AI_ERROR` `UNKNOWN` `STREAM_CLOSED` `NETWORK_ERROR`、以及报文级细分 | 插件（宿主不管这些） |
+| `QUOTA` `AUTH` `CONTEXT_WINDOW_EXCEEDED` `HTTP_413` `RATE_LIMIT` … | 谁都不续 |
+| DSML 泄漏形态、`max-tokens` | 插件（宿主没有这个概念） |
+
+开关就是一行配置，判据代码两条都留着，只是不再叠加发送：
+
+```yaml
+- id: dsml-guard
+  name: dsh-dsml-guard
+  config:
+    skipHostRetriedCodes: false   # 恢复 0.1.3 的行为：宿主重试耗尽后，插件再补一条继续
+```
+
+> **什么时候该切成 `false`**：宿主根本没有这套重试时 —— DSH < 0.2.2，或者从 profile 的
+> `cordis.patch.yml` 里摘掉了 `llm-retry` 那一行。注意**删掉 `retryPolicy` 并不等于关掉重试**：
+> `llm-deepseek` 的缺省就是 `normal` + 5 次；设置页也只有 `normal` / `always` 两档，没有「关」。
+> 另外**不建议把重试策略选成「所有错误」**：那是无上限重试，
+> 连 `AUTH / QUOTA / CONTEXT_WINDOW_EXCEEDED` 都会一直重打，正好踩穿本插件刻意保护的边界。
+>
+> 本插件不监听 `agent/request-error`，与 `llm-retry` 不在同一条 waterfall 上，两者不会互相抢决策。
+
 ## 测试
 
 ```powershell
-node test/run.mjs          # 35 条单元用例，不含真实会话
+node test/run.mjs          # 42 条单元用例，不含真实会话
 node test/replay-real.mjs  # 端到端：动态扫描会话存档，把捕获到的泄漏正文原样喂进来
 ```
 
@@ -284,3 +323,6 @@ node test/replay-real.mjs  # 端到端：动态扫描会话存档，把捕获到
 - **续跑的判据是启发式的**：`tailCloseMinChars` 这条阈值来自实测分布（完整答案是 755 字符量级，
   空产出是 1 字符量级），80 字符是我在两者之间取的保守值，不是上游给的信号。
 - 插件**不改请求**，所以上游该漏还是会漏；它只保证「漏了你也看不见墙，且这一轮不会白跑」。
+- **临时错误默认不再兜底**（0.1.4 起）：`EMPTY_RESPONSE/SERVER/TIMEOUT/TRANSPORT` 交给 DSH 的 `llm-retry`
+  在 step 内重试（它只有 `normal` / `always` 两档，不提供「完全关闭」的档位），重试耗尽后这一轮就以错误结束，
+  不会再有插件补的「继续」。要旧行为就把 `skipHostRetriedCodes` 置 `false`。

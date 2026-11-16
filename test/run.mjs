@@ -167,8 +167,40 @@ test('tail-close + 正文极短 → 续跑', () => {
   assert.equal(verdict.retry, true)
 })
 
-test('上游抖动类错误 → 续跑', () => {
-  for (const code of ['TIMEOUT', 'TRANSPORT', 'SERVER']) {
+// ★ 0.1.4：与宿主重试策略重叠的四个码默认交给宿主（DSH ≥0.2.2 的 llm-retry 在 step 内
+//   已带退避重试过），插件不再叠加一条「继续」。开关是 cfg.skipHostRetriedCodes。
+test('宿主已重试的码：默认交给宿主，不叠加「继续」', () => {
+  for (const code of ['TIMEOUT', 'TRANSPORT', 'SERVER', 'EMPTY_RESPONSE']) {
+    const verdict = decideContinue({ kind: 'error', error: { code, message: code } }, {}, CFG)
+    assert.equal(verdict.retry, false, `${code} 应当交给宿主重试策略`)
+  }
+})
+
+test('重叠码集合 = 宿主默认可重试集 ∩ 本插件 retryCodes', () => {
+  const overlap = CFG.retryCodes.filter((code) => guard.HOST_RETRIED_CODES.has(code)).sort()
+  assert.deepEqual(overlap, ['EMPTY_RESPONSE', 'SERVER', 'TIMEOUT', 'TRANSPORT'])
+  // RATE_LIMIT 不在重叠面里：插件本来就不续它
+  assert.equal(guard.HOST_RETRIED_CODES.has('RATE_LIMIT'), false)
+})
+
+test('skipHostRetriedCodes 默认 true，只有显式 false 才关', () => {
+  assert.equal(resolveConfig({}).skipHostRetriedCodes, true)
+  assert.equal(resolveConfig({ skipHostRetriedCodes: true }).skipHostRetriedCodes, true)
+  assert.equal(resolveConfig({ skipHostRetriedCodes: false }).skipHostRetriedCodes, false)
+  // 写错类型不炸，也不误开
+  assert.equal(resolveConfig({ skipHostRetriedCodes: 'no' }).skipHostRetriedCodes, true)
+})
+
+test('skipHostRetriedCodes=false：恢复旧行为，宿主重试耗尽后仍补一条继续', () => {
+  const legacy = resolveConfig({ skipHostRetriedCodes: false })
+  for (const code of ['TIMEOUT', 'TRANSPORT', 'SERVER', 'EMPTY_RESPONSE']) {
+    const verdict = decideContinue({ kind: 'error', error: { code, message: code } }, {}, legacy)
+    assert.equal(verdict.retry, true, `${code} 应当续跑`)
+  }
+})
+
+test('宿主不管的码仍然由插件续跑（开关只关重叠面）', () => {
+  for (const code of ['MALFORMED_RESPONSE', 'PI_AI_ERROR', 'STREAM_CLOSED', 'NETWORK_ERROR', 'UNKNOWN']) {
     const verdict = decideContinue({ kind: 'error', error: { code, message: code } }, {}, CFG)
     assert.equal(verdict.retry, true, `${code} 应当续跑`)
   }
@@ -213,8 +245,8 @@ test('单次回复 token 到顶（max-tokens）→ 续跑', () => {
   assert.equal(verdict.retry, true)
 })
 
-test('上游空响应 / 流中断 / 网络错误 → 续跑（可重试集）', () => {
-  for (const code of ['EMPTY_RESPONSE', 'STREAM_CLOSED', 'NETWORK_ERROR']) {
+test('流中断 / 网络错误 → 续跑（宿主不管的分类盲区）', () => {
+  for (const code of ['STREAM_CLOSED', 'NETWORK_ERROR']) {
     const verdict = decideContinue({ kind: 'error', error: { code, message: code } }, {}, CFG)
     assert.equal(verdict.retry, true, `${code} 应当续跑`)
   }
@@ -357,9 +389,16 @@ function withImmediateTimers(fn) {
   }
 }
 
+// 用一个**宿主不管**的码做端到端夹具（MALFORMED_RESPONSE 不在 llm-retry 的可重试集里，
+// 默认配置下插件仍然会续跑）。宿主已覆盖的 TIMEOUT 见下面专门的两条用例。
 const FAIL_EVENT = {
   type: 'turn/end',
-  data: { reason: { kind: 'error', error: { code: 'TIMEOUT' } } },
+  data: { reason: { kind: 'error', error: { code: 'MALFORMED_RESPONSE', message: 'malformed response' } } },
+}
+
+const TIMEOUT_EVENT = {
+  type: 'turn/end',
+  data: { reason: { kind: 'error', error: { code: 'TIMEOUT', message: 'request timed out' } } },
 }
 
 test('apply：默认配置下 失败-继续×4，第 4 次失败不再补发（共 3 次）', () => {
@@ -393,6 +432,30 @@ test('apply：上下文总体超限不补发继续', () => {
     h.emit({ id: 's1' }, ctxErr)
   })
   assert.equal(h.followups.length, 0)
+})
+
+test('apply：宿主已覆盖的 TIMEOUT 默认一次也不补发', () => {
+  const h = makeHarness()
+  withImmediateTimers(() => {
+    for (let i = 0; i < 4; i++) h.emit({ id: 's1' }, TIMEOUT_EVENT)
+  })
+  assert.equal(h.followups.length, 0)
+})
+
+test('apply：skipHostRetriedCodes=false 时 TIMEOUT 恢复补发（旧兜底）', () => {
+  const h = makeHarness({ skipHostRetriedCodes: false })
+  withImmediateTimers(() => {
+    for (let i = 0; i < 4; i++) h.emit({ id: 's1' }, TIMEOUT_EVENT)
+  })
+  assert.equal(h.followups.length, 3)
+})
+
+test('apply：max-tokens 续跑不受开关影响（开关只关错误码重叠面）', () => {
+  const h = makeHarness()
+  withImmediateTimers(() => {
+    h.emit({ id: 's2' }, { type: 'turn/end', data: { reason: { kind: 'max-tokens' } } })
+  })
+  assert.equal(h.followups.length, 1)
 })
 
 console.log(lines.join('\n'))
