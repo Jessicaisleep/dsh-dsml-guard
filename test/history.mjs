@@ -1,8 +1,15 @@
 /**
  * 端到端：走真实 chunk 序列（block-start → text-delta… → block-end → finish），
- * 断言两件事必须同时成立：
- *   ① 屏幕上看到的（text-delta 之和）没有标记；
- *   ② **写入历史的 block-end 全文也没有标记** —— 这一条才是「切断污染」的证据。
+ * 断言三件事必须同时成立：
+ *   ① 屏幕与历史一致（text-delta 之和 === block-end 全文），否则下一轮又喂回去；
+ *   ② 漏进正文的整段工具调用被包进代码围栏（0.1.9 起；旧行为是整段删掉）；
+ *   ③ 标记只出现在围栏**内部** —— 围栏外的散文里一个标记都不许有。
+ *
+ * 为什么不再要求「显示层没有标记」（旧 0.1.8 的断言）：
+ * 用户实测（m02746）整段删掉会让那一轮白跑（agent-loop 见 toolCalls.length === 0
+ * 就 completed，既没工具可执行也没正文可看）。改成包围栏后内容保留、`track.block`
+ * 仍为 true，补发「继续」的兜底照旧生效。围栏内的标记是人能读懂的代码块内容，
+ * 且 sanitizer 自己在围栏内不解析标记，不会二次触发。
  */
 import assert from 'node:assert/strict'
 import { apply } from '../lib/index.js'
@@ -64,9 +71,22 @@ console.log('原文长度              :', dirty.length)
 console.log('显示出来（text-delta）:', JSON.stringify(visible), `共 ${visible.length} 字符`)
 console.log('历史里（block-end）   :', JSON.stringify(blockEndText), `共 ${blockEndText.length} 字符`)
 
-assert.equal(MARK.test(visible), false, '显示层不该有标记')
-assert.equal(MARK.test(blockEndText), false, '写入历史的 block-end 也不该有标记')
 assert.equal(blockEndText, visible, '历史必须等于用户实际看到的，否则下一轮又喂回去')
 assert.equal(blocks, 1)
 
-console.log('\nPASS：显示与历史都被清洗，历史 = 屏幕内容，污染链已切断')
+// ② 整段工具调用被包进围栏
+assert.match(visible, /^```text\n/, '漏进正文的整段调用必须以 ```text 围栏开头')
+assert.match(visible, /\n```$/, '围栏必须收尾')
+
+// ③ 围栏外的散文里不许有标记：剥掉围栏行与围栏块内容再查
+const outsideFence = visible
+  .replace(/```[\s\S]*?```/g, '') // 去掉所有围栏块（含内容）
+  .replace(/^```.*$/gm, '')
+assert.equal(MARK.test(outsideFence), false, '围栏外的正文不该有标记')
+
+// 围栏内的内容必须原样保留（除上游那个被截断的游离 `<` 残渣 —— 它不是内容，留在
+// 围栏里会让行首多一个字符、markdown 认不出代码块，所以实现里把它当标记残渣丢了）
+const inner = visible.replace(/^```text\n/, '').replace(/\n```$/, '')
+assert.equal(inner, dirty.slice(1), '围栏内的原始调用必须一字不动地保留（只去掉游离的 `<`）')
+
+console.log('\nPASS：整段调用被包进围栏留在正文，历史 = 屏幕内容，内容零丢失')

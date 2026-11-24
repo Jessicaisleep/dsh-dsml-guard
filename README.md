@@ -5,7 +5,7 @@
 > 余额、额度、鉴权、上下文总体超限这类发继续只会再报错的，一律不动。默认连续 3 次失败后停发。
 > 与 DSH 自带「重试策略」重叠的四个码默认交给宿主重试，插件不重复打（见「与 DSH 自带重试策略的分工」）。
 
-**当前版本：0.1.4**（2026-11-17）。已发布到 npm（`dsh-dsml-guard@0.1.4`）与 GitHub（`v0.1.4` tag）。
+**当前版本：0.1.10**（2026-11-24）。
 插件市场（awesome-dsh-plugin / dshmarket）收录的是仓库 URL、版本从 npm 自动刷新，无需在条目里写版本号。
 
 ## 为什么需要它
@@ -32,10 +32,31 @@
 
 认三种竖线写法：`｜｜DSML｜｜`（实测主流）、`｜DSML｜`、`||DSML||`。处理四种残渣：
 
-- 完整 `invoke` / `tool_calls` 块 → **整块摘掉**（按标签深度配对，不是贪婪正则）；
+- 完整 `invoke` / `tool_calls` 块 → **包进 `text` 代码围栏留在正文**（0.1.9 起；见下面 ①a，
+  0.1.8 及更早是整块摘掉，会丢内容）；
 - 结尾连缀的闭合标签 → 摘掉；
 - 孤立的外层包裹残片 `<｜｜DSML｜｜ calls>` → 摘掉；
 - 光头标记 `<｜｜DSML｜｜>`（后面没有标签名）→ 摘掉。
+
+**①a DSML 包围栏**（`dsmlToFence`，0.1.9 起，默认开）
+
+整段工具调用漏进正文时，不再整段删掉，改为**原样包进 ```text 围栏留在正文**：
+
+```
+```text
+<｜｜DSML｜｜ tool_calls><｜｜DSML｜｜ invoke name="pwsh">…</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>
+```
+```
+
+**为什么改**（用户实测，m02746）：删掉会让那一轮**白跑**。宿主 `dsh-agent-loop/src/agent.ts`
+组装完 assistant 消息后走 `const toolCalls = message.content.filter(b => b.type === 'tool-call'); if (toolCalls.length === 0) return { kind: 'completed' }`
+—— 整段调用进了正文就既没有工具可执行、也没有正文可看，这一轮看起来像「会话停了」。
+而空 text block 并不会弄坏历史：`dsh-llm-deepseek/src/serialize.ts` 对 `text.length === 0`
+的块直接 `return []`，对空消息 `continue`。所以包围栏是安全且更好的选择：内容不丢、
+`track.block` 仍为 true、「这一轮没真发过 tool-call → 补发继续」的兜底照旧触发。
+
+代价对照（本机实测）：全库 45 个含 DSML 的 text 块里 12 个是真工具调用，旧行为**9 个被清空、
+共丢 8809 字符**，其中一例是 6364 字的完整 `round5-brief.md` 文件内容。关掉开关回到旧行为。
 
 **代码围栏 ``` 与行内 `code` 里一律不动** —— 那是人在讨论语法，删了才是坏事。
 
@@ -48,6 +69,79 @@
   插件在 `block-end` 上把文本块替换成「实际发出去的内容」，让 **历史 = 屏幕**。
 
 这条就是「上下文污染」的断点：**新会话从第一轮起，历史里不会再留下标记。**
+
+**①b THINKING 归位**（`thinkingToReasoning`，0.1.6 起，默认开）
+
+上游偶尔把**思考内容漏进正文**：正文里出现 `<thinking>**Build still running**</thinking>`
+这类标签文字。本机 728 条 assistant 消息里有 135 条这样，形态分布：
+
+| 形态 | 数量 |
+| --- | --- |
+| 成对闭合 `<thinking>…</thinking>` | 86 |
+| **没有闭合** `<thinking>…`（生成被截断） | 42 |
+| 双开双闭 | 6 |
+| 一开双闭 / 孤立多余闭合标签 | 2 |
+
+- 117 条标签在块首、18 条在中间；93 条有闭合标签里只有 9 条闭标签后面还跟着正文。
+- **`reasoning` 块本身就是 DSH 的原生类型**（同一批消息里有 464 个干净的 reasoning 块），
+  客户端有专门的折叠渲染器 `ReasoningRow.tsx`。
+
+**为什么是「改块类型」而不是「补标签」**：DSH 不认识 `<thinking>` 这个语法，正文里补全
+`</thinking>` 之后它依然只是一段字面文字，照原样显示、照原样回灌下一轮上下文 —— 补标签
+不产生任何效果。真能让它变成「思考」的通道是 `block-end` 携带的 `block.type`：
+`BlockAssembler.push()` 里 `case 'block-end'` 是「首次 close 生效、以 `chunk.block` 为准」，
+而 `agent-loop` 的 `for await (const chunk of stream) live.push(chunk)` 正是插件
+`llm/stream` yield 出去的东西。所以做的是**把这段文字从 text 块搬到 reasoning 块**。
+
+具体行为：
+
+- 流式阶段用一个「闸门」把思考段截下，不让它先以正文形式闪一下；`text-delta` 只放行正文。
+- `block-end` 时按标签把整块切成「正文 / 思考」片段，思考片用新建 index（`100000+n`）
+  落成 `{type:'reasoning', text}` 块；正文片沿用原 index。客户端 `assistant.ts` 里
+  `blocks` 是稀疏数组（`readonly (AssistantBlock | undefined)[]`，注释「Missing indices are
+  invisible」），乱序新增块是安全的。
+- **未闭合的按「到块尾都是思考」处理** —— 上游被截断时就是这个形态。
+- 正文里**孤立多出来的 `</thinking>`**（开标签被上游丢了）直接抹掉，不当思考。
+- **代码区里的标签不动**：围栏块与行内 `code` 里出现的 `<think>` 一律当正文原样保留。
+  这条不是洁癖 —— 全库 22471 个真实 text 块里有 7 个是在**讨论这个标签本身**
+  （「a stray 8-byte `` `<think>` `` discards a completed 11.7k-token generation, ~2×/day」），
+  旧逻辑会把标签后面的正文整段搬进 reasoning 块，实测两个最严重的分别误搬 **2083 字**（seq=738）
+  和 **2616 字**（seq=164）。判据在 `codeRanges(text)` 里，按 CommonMark 的围栏规则配对，
+  行内反引号以「同等长度成对 + 空行断段」收口。
+- 代价：块数变化会让 `replayState` 的块签名对不上，该条消息失去「回放保真」元数据
+  （`assembled()` 里 `if (envelope.blocks.length !== all.length) return { blocks, replay: undefined }`，
+  以及 `validateReplay` 的 `block count mismatch` → `onDegrade`）。实测 728 条里已有 45 条
+  本来就没有 `replayState`，这不影响对话本身。
+
+关掉这个开关（设置页「THINKING 归位」）就回到 0.1.5 的行为：标签文字原样留在正文里。
+
+**①c 代码泄露包围栏**（`codeLeakFence`，0.1.7 起，默认开）
+
+上游有时会**把要执行的命令或补丁念进正文**，而不是真的发起 `pwsh` / `apply_patch` 调用。
+问题会话 `session-26470037…` 里实测到三段（都是 text 块，且在任何 `tool-call` 的
+`arguments` 里都**找不到** —— 也就是说命令从未被执行）：
+
+| seq | 形态 | 长度 |
+| --- | --- | --- |
+| 3141 | `$ffmpeg='…ffmpeg.exe'; $dir='…'; foreach($f in @('S01_remade_1080p.mp4',…)){…}` | 415 |
+| 3316 | `$blender='…blender.exe'; $blend='…blend'; $script=@' import bpy … '@; & $blender …` | 576 |
+| 2675 | `*** Begin Patch / *** Add File: …motion_v02.py / +…`（28 行 `+`，含 `S01 = [...]` 参数表） | 8113 |
+
+处理方式：**内容一字不改，只包一层 markdown 代码围栏**（`powershell` / `diff`），让它显示成
+代码块而不是一段散文。
+
+为什么不是「转成真 tool-call 让 DSH 执行」：`agent-loop` 的顺序是先
+`createAssistantMessage({ content: live.blocks() })`，**之后**才
+`message.content.filter(block => block.type === 'tool-call')` 去执行。插件在 `llm/stream`
+里注入的 tool-call 块会进 `live.blocks()`，因此**会被真的执行** —— 那等于替模型执行它并没有
+发起的命令（改文件、跑渲染），副作用不可逆。所以只做显示层归位。
+
+判据刻意收得很紧（块级、起点锚定）：`^\$\w+\s*=` 且同时出现 `& '…'` / `foreach(` /
+`Join-Path` / `Test-Path` / `Write-Output` 之一，或整段 `*** Begin Patch … *** End Patch`。
+本会话 233 个 text 块里只命中 3 个（就是上表三条），**零误伤** —— 正常的 markdown 围栏、
+行内 `$变量`、`+ 列表项` 都不动。
+
+关闭开关（设置页「代码泄露包围栏」）即完全跳过这一步。
 
 ### 关于「越漏越多」：本机数据不支持这个假设
 
@@ -101,6 +195,18 @@
 兜底码报文里是「未配置凭据 / 请先登录 / 无此模型 / 余额不足」时按报文否决。
 明确永久码（额度/鉴权/上下文/体积）按码否决、信任码本身，不被报文里的网络措辞带偏。
 
+> **0.1.8 起的两处例外**：`AUTH` 与 `INVALID_REQUEST` 仍留在 `neverCodes`（默认不续），
+> 但在设置页留了勾选框，**勾上就允许越过 `neverCodes`**。依据是本机 459 个会话的实测续跑率：
+>
+> | 错误码 | 出错次数 | 之后补过「继续」 | 续后真出内容 | 续后跑完整轮 |
+> | --- | --- | --- | --- | --- |
+> | `AUTH` | 44 | 13 | 10 | **7** |
+> | `INVALID_REQUEST` | 89 | 54 | 34 | **20** |
+>
+> `AUTH` 有效是因为「换了密钥/充值之后再发继续」确实能接着干；`INVALID_REQUEST` 有效是因为
+> 它有大量本机 `read tcp … i/o timeout` 被误分类成 400。其余 `neverCodes`（`QUOTA` /
+> `CONTEXT_WINDOW_EXCEEDED` / `MISSING_CREDENTIAL` …）没有这个例外，勾了也照样拦下。
+
 还有两道闸：
 
 - **同一会话连续续跑上限** `maxConsecutive`（默认 **3**，夹在 1–100）：连续 3 次「失败 → 继续」后不再发；
@@ -128,7 +234,7 @@
 dsh plugin --profile <你的 profile> add dsh-dsml-guard
 ```
 
-当前 npm 最新版是 **0.1.3**。想锁死版本、避免以后自动漂移，写成 `dsh-dsml-guard@0.1.3`。
+当前 npm 最新版是 **0.1.10**。想锁死版本、避免以后自动漂移，写成 `dsh-dsml-guard@0.1.10`。
 
 `--profile` 填对方实际在用的那个：
 **桌面应用用 `desktop`**，自启的 `dsh web` 服务用 `web`。填错 profile 等于没装 —— 重启多少次都不会加载。
@@ -138,7 +244,7 @@ dsh plugin --profile <你的 profile> add dsh-dsml-guard
 不用 npm 也可以直接从 GitHub 装（锁 tag，内容不会漂移）：
 
 ```sh
-dsh plugin --profile <profile> add https://github.com/Jessicaisleep/dsh-dsml-guard/archive/refs/tags/v0.1.3.tar.gz
+dsh plugin --profile <profile> add https://github.com/Jessicaisleep/dsh-dsml-guard/archive/refs/tags/v0.1.10.tar.gz
 ```
 
 > 用 GitHub 源装会在对方机器上跑构建脚本（本包没有构建步骤，只是 pnpm 的常规授权流程），
@@ -170,7 +276,7 @@ dsh --profile web --dump-config | Select-String "dsml-guard"
 发布由 GitHub Actions 用 **npm Trusted Publishing（OIDC）** 完成，本地不需要任何 npm token，也就不会再被 2FA 挡住。
 推一个 `v*` tag 就发一版；普通提交只触发 `ci.yml`（Node 20/22/24 三档跑测试 + `npm pack --dry-run`），**不会发版**。
 
-`publish.yml` 在 tag 推送后自动执行：语法检查 → 42 条单元测试 → 校验 tag 与 `package.json` 版本一致 → `npm publish`。
+`publish.yml` 在 tag 推送后自动执行：语法检查 → 78 条单元测试 → 校验 tag 与 `package.json` 版本一致 → `npm publish`。
 
 **常规流程**（版本号交给 npm 改 + 打 tag，一次到位）：
 
@@ -183,8 +289,8 @@ git push --follow-tags   # 推提交 + 推 tag，触发 publish.yml
 
 1. **tag 必须和 `package.json` 的 `version` 逐字一致**。`publish.yml` 里有一步
    `Verify tag matches package version`，不一致直接 `::error::tag v$TAG does not match package.json version $VER` 退出。
-2. **如果已经手工把 `package.json` 改成了目标版本号，就不要再跑 `npm version patch`** —— 它会再 +1（0.1.3 → 0.1.4），
-   和 tag 对不上。这种情况直接 `git tag -a v0.1.3 -m "release 0.1.3"` 然后推 tag 即可。
+2. **如果已经手工把 `package.json` 改成了目标版本号，就不要再跑 `npm version patch`** —— 它会再 +1（0.1.9 → 0.1.10），
+   和 tag 对不上。这种情况直接 `git tag -a v0.1.10 -m "release 0.1.10"` 然后推 tag 即可。
 3. **本机 `github.com:443` 时段性连不上**（SSH 又没配密钥）。推不上去时不用硬扛：
    `api.github.com` 一直通，可以用它的 **Git Data API**（造 blob/tree/commit/tag 对象，再 `PATCH /git/refs/heads/main`、
    `POST /git/refs` 建 tag ref）把提交和 tag 直接推上去，完全绕开 `github.com:443`。
@@ -215,6 +321,12 @@ git push --follow-tags   # 推提交 + 推 tag，触发 publish.yml
 | **0.1.3** | **2026-11-12** | 连续续跑上限 5→**3**、正常回复/`reason` 为空的正常完成轮清零；新增 `max-tokens` 续跑；可重试集补 `EMPTY_RESPONSE/STREAM_CLOSED/NETWORK_ERROR`；对 `INVALID_REQUEST/CLIENT_ERROR/PI_AI_ERROR/UNKNOWN` 做报文级细分（本机/上游网络波动续、永久配置错误否）；`decideSend` 纯函数化并加端到端用例（单测总数扩到 35 条） |
 
 | **0.1.4** | **2026-11-17** | 新增 `skipHostRetriedCodes`（默认 `true`）：与 DSH ≥0.2.2 模型设置页「重试策略」（`@deepseek-ai/dsh-llm-retry`，默认「仅临时错误」）重叠的 `EMPTY_RESPONSE/SERVER/TIMEOUT/TRANSPORT` 交给宿主在 step 内退避重试，插件不再叠加一条「继续」；置 `false` 恢复 0.1.3 的兜底。清洗与 `max-tokens`/泄漏续跑不受影响（真实会话回放 28 条、残留 0 条、判续 18 条，与 0.1.3 一致）。单测 35→42 |
+| **0.1.5** | **2026-11-24** | 新增客户端设置页（`settings.section`，id `dsml-guard`）：DSML 补全开关、THINKING 归位、自动续跑各错误类型中英对照多选、发送「继续」次数等。修掉 `export default` 吞掉 `Config` 导致设置页静默消失的坑（宿主 `unwrapExports` 只认 `exports.default ?? exports`）。`dsh.client.inject` 去掉服务名与不存在的包。勾选与 DSH 重叠的错误码后先检测宿主本轮是否真的重试过（`llm/retry` 事件），生效时不叠加续跑并提示去关 DSH 重试。单测 42→46 |
+| **0.1.6** | **2026-11-24** | 新增 `thinkingToReasoning`（默认开）：把漏进正文的 `<thinking>`/`<think>`/`<reasoning>` 段搬进真正的 reasoning 块，不再当正文显示；未闭合按「到块尾都是思考」处理，孤立多余的 `</thinking>` 直接抹掉。设置页加对应开关。顺带修掉「闸门压住块尾正文导致屏幕与历史不一致」的问题。真实会话 135 条泄露样本回放：135/135 正确分片。单测 46→59 |
+| **0.1.7** | **2026-11-24** | 新增 `codeLeakFence`（默认开）：上游把要执行的命令 / 补丁念进正文时（`$var=…; & exe`、`*** Begin Patch …`），把这段包进 markdown 代码围栏显示，内容一字不改、**不会被执行**。`THINK_TAG_NAMES` 补上 `analysis`（实测有带属性的 `<analysis 彩票代理>` 漏进正文）。真实会话 233 个 text 块：命中 3 个（就是实测那三条命令/补丁），零误伤。单测 59→68 |
+| **0.1.8** | **2026-11-24** | 按本机 459 个会话的实测续跑率重排可选项：新增 `retryInvalidRequest`（`INVALID_REQUEST` 89 次里 54 次续跑、20 次跑完整轮），`retryAuth` 的说明改为「实测 44 次里 13 次续跑、7 次跑完整轮」而不是「续跑通常无效」；两者标 `forceable`，**勾上才越过 `neverCodes`**，`QUOTA`/`CONTEXT_WINDOW_EXCEEDED` 等仍被拦。`TIMEOUT`/`TRANSPORT` 的 hint 补上实测「续跑基本救不回来」。单测 68→71 |
+| **0.1.9** | **2026-11-24** | 新增 `dsmlToFence`（默认开）：整段 DSML 工具调用漏进正文时，**不再整段删掉，改为包进 ```text 围栏留在正文**。原因是删掉会让那一轮白跑（`agent-loop` 见 `toolCalls.length === 0` 就 `completed`，既没工具可执行也没正文可看），而空 text block 不会弄坏历史（`serialize.ts` 直接 `return []`）。本机实测旧行为 9 个块被清空、共丢 8809 字符（含 6364 字文件内容）。顺带修掉「上游先吐一个截断的 `<` 再吐标记」时围栏落在行中的问题。设置页加「DSML 包围栏」开关。单测 71→72 |
+| **0.1.10** | **2026-11-24** | 修掉 THINKING 判据在「代码区里讨论语法」处的误伤：新增 `codeRanges(text)`，围栏块与行内反引号里的 `<think>` 一律当正文原样保留，不再把后面的正文搬进 reasoning 块（全库 22471 个 text 块里 7 个属于此类，最严重两例分别误搬 2083 字、 2616 字）。命中块 1384→1377，代码区误伤 7→0。单测 72→78 |
 
 > `0.1.3` 的完整判定依据见下方「与同类插件的覆盖对比」；`0.1.4` 的分工见「与 DSH 自带重试策略的分工」。
 
@@ -226,6 +338,9 @@ git push --follow-tags   # 推提交 + 推 tag，触发 publish.yml
   config:
     enabled: true            # 总开关
     sanitize: true           # 抹标记
+    dsmlToFence: true        # 整段工具调用漏进正文时包进围栏留下来，不删（见「①a DSML 包围栏」）
+    thinkingToReasoning: true   # 把漏进正文的 thinking 段搬进 reasoning 块（见「①b THINKING 归位」）
+    codeLeakFence: true      # 把念进正文的命令/补丁包进代码围栏（见「①c 代码泄露包围栏」）
     autoContinue: true       # 自动补「继续」
     continueText: "继续"
     maxConsecutive: 3        # 连续续跑上限（默认 3，正常回复清零）
@@ -236,6 +351,9 @@ git push --follow-tags   # 推提交 + 推 tag，触发 publish.yml
     neverCodes: [QUOTA, QUOTA_EXCEEDED, ACCOUNT_QUOTA, RATE_LIMIT, AUTH,
                  MISSING_CREDENTIAL, CONTEXT_WINDOW_EXCEEDED, UNKNOWN_MODEL,
                  HTTP_413, CLIENT_ERROR, INVALID_REQUEST]
+    # 14 个错误类型勾选框（设置页写，不写就走默认）。0.1.8 新增两项：
+    retryAuth: false            # 勾上后允许越过 neverCodes（实测换密钥后续跑有效）
+    retryInvalidRequest: false  # 勾上后允许越过 neverCodes（实测多为 read tcp i/o timeout）
 ```
 
 ## 与 DSH 自带重试策略的分工（0.1.4）
@@ -253,7 +371,8 @@ DSH 0.2.2 起，模型设置页每个 API 下多了**「重试策略」**（默�
 | --- | --- |
 | `EMPTY_RESPONSE` `SERVER` `TIMEOUT` `TRANSPORT` | 宿主 `llm-retry`（插件跳过） |
 | `MALFORMED_RESPONSE` `PI_AI_ERROR` `UNKNOWN` `STREAM_CLOSED` `NETWORK_ERROR`、以及报文级细分 | 插件（宿主不管这些） |
-| `QUOTA` `AUTH` `CONTEXT_WINDOW_EXCEEDED` `HTTP_413` `RATE_LIMIT` … | 谁都不续 |
+| `QUOTA` `CONTEXT_WINDOW_EXCEEDED` `HTTP_413` `RATE_LIMIT` … | 谁都不续 |
+| `AUTH` `INVALID_REQUEST` | 默认谁都不续；设置页勾上才由插件续（见「② 续跑」下的 0.1.8 例外表） |
 | DSML 泄漏形态、`max-tokens` | 插件（宿主没有这个概念） |
 
 开关就是一行配置，判据代码两条都留着，只是不再叠加发送：
@@ -276,7 +395,7 @@ DSH 0.2.2 起，模型设置页每个 API 下多了**「重试策略」**（默�
 ## 测试
 
 ```powershell
-node test/run.mjs          # 42 条单元用例，不含真实会话
+node test/run.mjs          # 78 条单元用例，不含真实会话
 node test/replay-real.mjs  # 端到端：动态扫描会话存档，把捕获到的泄漏正文原样喂进来
 ```
 
@@ -290,6 +409,19 @@ node test/replay-real.mjs  # 端到端：动态扫描会话存档，把捕获到
 断言「显示 == 历史」两边都不含标记。
 
 > **0.1.1 起的修正**：`0.1.0` 只处理 `text-delta`，没有覆盖 `block-end`，所以历史里仍会留下标记。
+
+THINKING 归位（0.1.6）另有一组用例：`splitThinkingSegments` 的成对闭合/未闭合/多段交替/别名/
+孤立闭合标签/无标签回归，`createThinkingGate` 的半截标签压住与闭合后恢复外发，以及
+`llm/stream` 端到端「带 thinking 的 text 块被拆成 reasoning + text 两块」「未闭合整块转
+reasoning」「关掉开关后不拆块」「普通回复不被误改」。
+
+代码泄露包围栏（0.1.7）的用例：`detectCodeLeak` 的 PowerShell 命令 / `*** Begin Patch` 命中，
+以及「普通正文、正常 markdown 围栏、`+ 列表项`、只写 Begin 没写 End」四种不误伤；`fenceizeCode`
+只加围栏不改正文；`llm/stream` 端到端「命令被包进 powershell 围栏且去掉围栏行后与原文完全一致」
+「patch 包进 diff 围栏」「关掉开关后保持原样」「thinking 段里的命令也包围栏且仍归 reasoning 块」。
+
+续跑可选码（0.1.8）的用例：`AUTH` / `INVALID_REQUEST` 默认不续、显式勾选后越过 `neverCodes` 续跑；
+`QUOTA` 勾了也不越过（没有 `forceable` 标记）。
 
 ## 与同类插件的覆盖对比（0.1.3 的判定依据）
 
@@ -326,3 +458,50 @@ node test/replay-real.mjs  # 端到端：动态扫描会话存档，把捕获到
 - **临时错误默认不再兜底**（0.1.4 起）：`EMPTY_RESPONSE/SERVER/TIMEOUT/TRANSPORT` 交给 DSH 的 `llm-retry`
   在 step 内重试（它只有 `normal` / `always` 两档，不提供「完全关闭」的档位），重试耗尽后这一轮就以错误结束，
   不会再有插件补的「继续」。要旧行为就把 `skipHostRetriedCodes` 置 `false`。
+
+## 踩坑记录：`export default` 会吞掉 `Config`，导致设置页永远不出现
+
+**症状**：插件能正常清洗、能正常续跑，但 DSH 设置页左侧导航里根本没有「DSML 防护」这一项，
+浏览器 console 也没有任何报错。
+
+**根因**：宿主 Cordis Loader 的 `unwrapExports`（见
+`app.asar/dsh/node_modules/@deepseek-ai/cordis-plugin-loader/lib/index.js` 尾部）实现是
+
+```js
+unwrapExports(exports) {
+  if (isNullable(exports)) return exports
+  exports = exports.default ?? exports      // 有 default 就直接换成它
+  if (!exports.__esModule) return exports
+  return exports.default ?? exports
+}
+```
+
+也就是说 **只要模块有 `export default`，所有命名导出都被丢弃**。而设置页的注册链是
+`runtime.Config` → `settings.describe()` → 客户端 `configForms.whileServed()` → `slots.register`，
+第一环断掉就静默地没有页面：
+
+- `dsh-settings` 的 `describe()` 拿 `entry.fiber.runtime.Config`，且要求它 `'toJSON' in schema`；
+  `Config` 是 `undefined` 就直接 `return []`，该 entry 连 descriptor 都不产生；
+- 客户端 `whileServed(['dsml-guard'])` 看的是 describe 结果里的 `ns` 集合，没有就永不触发注册。
+
+**正确写法**：`Config` 必须同时挂在 default 导出上（或者干脆不写 `export default`）：
+
+```js
+export const name = 'dsml-guard'
+export const inject = ['agents', 'llm']
+export default { apply, inject, name, Config }   // ← Config 不能漏
+```
+
+顺带两条同类约束：
+
+- `Config` 里**至少要有一个 `.volatile()` 字段**，否则 `describe()` 的 `volatileForm()` 返回
+  `undefined`，同样不产生 descriptor。（这也是 `dsh-bilibili` 没有设置页的原因：它的 `Config` 没有 volatile 字段。）
+- `dsh.client.inject` 里填的是**包名**，不是 Cordis 服务名。写了不存在的包不会报错
+  （`parseDshClient` 不校验、`arriveGraphRow` 对 `graphRows.get()` 返回 undefined 静默跳过），
+  但也提供不了任何依赖 —— 客户端实际依赖由 `lib/client.js` 自己的 `inject = ['slots','configForms']` 声明。
+
+**验证方法**（不需要 DevTools）：在 `apply` 里把探针写进 `document.title`，再用
+`windows_computer_use_list_windows` 读窗口标题即可。client.js 改动走 HMR 立即生效；
+index.js 改动必须重启 DSH（`disable` + `enable` 会复用已加载模块，不会重跑 `unwrapExports`）。
+
+

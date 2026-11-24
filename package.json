@@ -1,15 +1,17 @@
 {
   "name": "dsh-dsml-guard",
-  "version": "0.1.4",
-  "description": "Strips DSML markers leaked into assistant prose and resumes a turn when a 继续 genuinely helps (max-tokens, empty/closed streams, misclassified network blips), with a default cap of 3 consecutive failures reset by any normal reply; quota, auth and context-window errors are never retried; overlap with DSH's own per-provider retry policy (EMPTY_RESPONSE/SERVER/TIMEOUT/TRANSPORT) is delegated to the host by default (skipHostRetriedCodes). / 抹掉漏进正文的 DSML 标记，并只在「发继续能真正解决」时补发；默认连续 3 次失败后停发、正常回复清零；额度/鉴权/上下文超限一律不续；与 DSH 自带「重试策略」重叠的四个错误码默认交给宿主，不重复续跑（skipHostRetriedCodes）。",
+  "version": "0.1.10",
+  "description": "Keeps model output in the right block: leaked <thinking>/<analysis> text is moved into real reasoning blocks instead of showing as prose, DSML tool calls that leaked into the body are wrapped in a ```text fence and kept (no longer deleted, no tool is ever executed), and commands or patches the model merely narrated are fenced as code. Also resumes a turn when a 继续 genuinely helps (max-tokens, empty or closed streams, misclassified network blips) with a default cap of 3 consecutive failures reset by any normal reply; quota and context-window errors never resume, while AUTH and INVALID_REQUEST stay off by default but can be opted in. Overlap with DSH's own per-provider retry policy (EMPTY_RESPONSE/SERVER/TIMEOUT/TRANSPORT) is delegated to the host by default, and ticking such a code takes effect only when the host retry is provably not active this turn. Every switch has a settings page. / 把模型输出放回正确的区块：漏进正文的 thinking/analysis 段搬回真正的「思考」块、不再当正文显示；漏进正文的 DSML 工具调用包进代码围栏保留（不再整段删掉，也绝不真去执行）；模型只念出来没真执行的命令与补丁包成代码块。同时只在「发继续能真正解决」时补发（max-tokens、空响应/流中断、被误分类的网络抖动），默认连续 3 次失败后停发、正常回复清零；额度与上下文超限一律不续，鉴权失败与请求被拒默认不续但可勾选。与 DSH 自带「重试策略」重叠的四个错误码默认交给宿主，勾选后也要先确认宿主本轮没在重试才生效。所有开关都在客户端设置页。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "files": [
     "lib/index.js",
+    "lib/client.js",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -42,10 +44,19 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
   "scripts": {
-    "check": "node --check lib/index.js",
+    "check": "node --check lib/index.js && node --check lib/client.js",
     "test": "node test/run.mjs"
   }
 }
